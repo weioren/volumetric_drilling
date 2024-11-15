@@ -35,7 +35,6 @@ except ImportError:
         + "Please source <volumetric_plugin_path>/build/devel/setup.bash \n"
     )
 
-
 def rpy_to_quat(roll, pitch, yaw):
     cy = np.cos(yaw * 0.5)
     sy = np.sin(yaw * 0.5)
@@ -98,7 +97,6 @@ def pose_gen(pose_msg):
     )
 
     return pose_np
-
 
 def init_hdf5(args):
     world_adf = open(args.world_adf, "r")
@@ -217,6 +215,36 @@ def callback(*inputs):
         log.log(logging.DEBUG, "Queue full")
 
 
+# Initialize data structure for high-frequency drill kinematics
+high_freq_drill_kinematics = OrderedDict()
+high_freq_drill_kinematics['time'] = []
+high_freq_drill_kinematics['pose'] = []
+
+# Initialize a lock for thread safety
+drill_kinematics_data_lock = Lock()
+
+def high_freq_drill_pose_callback(pose_msg):
+    global high_freq_drill_kinematics
+    drill_kinematics_data_lock.acquire()
+    
+    # Get the timestamp
+    timestamp = pose_msg.header.stamp.to_sec()
+    
+    # Extract the pose data
+    pose_data = pose_gen(pose_msg)
+    
+    # Append the data
+    high_freq_drill_kinematics['time'].append(timestamp)
+    high_freq_drill_kinematics['pose'].append(pose_data)
+    
+    drill_kinematics_data_lock.release()
+
+def setup_high_freq_drill_subscriber():
+    # Replace 'mastoidectomy_drill' with the appropriate name if different
+    drill_pose_topic = "/ambf/env/mastoidectomy_drill/State"
+    rospy.Subscriber(drill_pose_topic, RigidBodyState, high_freq_drill_pose_callback)
+
+
 def write_to_hdf5():
     try:
         hdf5_vox_vol = f["metadata"].create_dataset("voxel_volume", data=voxel_volume)
@@ -225,6 +253,46 @@ def write_to_hdf5():
         f.close()
         print("File writing interrupted.")
         return
+    
+    # Write high-frequency drill kinematics
+    drill_kinematics_data_lock.acquire()
+    try:
+        if len(high_freq_drill_kinematics['time']) > 0:
+            if 'high_freq_drill_kinematics' not in f:
+                drill_group = f.create_group('high_freq_drill_kinematics')
+                time_dataset = drill_group.create_dataset(
+                    'time',
+                    data=np.array(high_freq_drill_kinematics['time']),
+                    maxshape=(None,),
+                    chunks=True,
+                    compression='gzip'
+                )
+                pose_dataset = drill_group.create_dataset(
+                    'pose',
+                    data=np.stack(high_freq_drill_kinematics['pose'], axis=0),
+                    maxshape=(None, 7),
+                    chunks=True,
+                    compression='gzip'
+                )
+            else:
+                drill_group = f['high_freq_drill_kinematics']
+                # Append data to existing datasets
+                time_dataset = drill_group['time']
+                pose_dataset = drill_group['pose']
+                new_time_data = np.array(high_freq_drill_kinematics['time'])
+                new_pose_data = np.stack(high_freq_drill_kinematics['pose'], axis=0)
+                # Resize datasets to accommodate new data
+                time_dataset.resize(time_dataset.shape[0] + new_time_data.shape[0], axis=0)
+                time_dataset[-new_time_data.shape[0]:] = new_time_data
+                pose_dataset.resize(pose_dataset.shape[0] + new_pose_data.shape[0], axis=0)
+                pose_dataset[-new_pose_data.shape[0]:] = new_pose_data
+            log.log(logging.INFO, ('high_freq_drill_kinematics', drill_group['pose'].shape))
+            # Reset the data
+            high_freq_drill_kinematics['time'] = []
+            high_freq_drill_kinematics['pose'] = []
+    except Exception as e:
+        print('INFO! No high-frequency drill kinematics data recorded in this batch since EXCEPTION:', str(e))
+    drill_kinematics_data_lock.release()
 
     ##################################
     #### Save img data and burr_change
@@ -326,12 +394,18 @@ def timer_callback():
             for key, data in data_dict.items():
                 container[key].append(data)
 
-            num_data = num_data + 1
-            if num_data >= chunk:
+            num_data += 1
+
+            # Incorporate high freq. drill poses
+            drill_kinematics_data_lock.acquire()
+            high_freq_data_length = len(high_freq_drill_kinematics['time'])
+            drill_kinematics_data_lock.release()
+
+            if num_data >= chunk or high_freq_data_length >= chunk:
                 log.log(logging.INFO, "\nWrite data to disk")
                 write_to_hdf5()
-                f, _, _, _, _ = init_hdf5(args)
                 num_data = 0
+
         except Empty:
             log.log(logging.NOTSET, "Empty queue")
 
@@ -470,7 +544,7 @@ def setup_subscriber(args):
             drill_force_feedback['time_stamp'] = []
             drill_force_feedback['wrench'] =[]
         else:
-            log.log(logging.CRITICAL, "CRITICAL! Failed to subscribe to " + args.force_topic)
+            log.log(logging.CRITICAL, "CRITICAL! Failed to subscribe to " + args.drill_force_feedback_topic)
             exit()
 
     # poses
@@ -500,6 +574,7 @@ def main(args):
     # setup ros node and subscribers
     rospy.init_node("data_recorder")
     subscribers = setup_subscriber(args)
+    setup_high_freq_drill_subscriber()
 
     print("Synchronous? : ", args.sync)
     # NOTE: don't set queue size to a large number (e.g. 1000).
